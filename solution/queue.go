@@ -1,9 +1,18 @@
 package solution
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
-	"fmt"
 	"sync"
+)
+
+// Sentinel errors allow callers to distinguish failure modes with errors.Is.
+var (
+	ErrJobNotFound  = errors.New("job not found")
+	ErrNotLeased    = errors.New("job is not currently leased")
+	ErrWrongWorker  = errors.New("lease is held by a different worker")
+	ErrLeaseExpired = errors.New("lease has expired")
 )
 
 // LeasedJob is what a worker receives when it successfully leases a job.
@@ -11,6 +20,7 @@ type LeasedJob struct {
 	ID             string
 	Payload        []byte
 	LeaseExpiresAt int64 // milliseconds, in the same frame as Clock.Now()
+	Attempt        int   // 1-based; how many times this job has been leased
 }
 
 // Clock is the queue's view of time. The test harness supplies a fake clock
@@ -40,15 +50,15 @@ type entry struct {
 	state          jobState
 	leasedTo       string
 	leaseExpiresAt int64
+	attempts       int // incremented each time the job is leased
 }
 
 // JobQueue is what you implement.
 type JobQueue struct {
-	clock   Clock
-	mu      sync.Mutex
-	jobs    map[string]*entry
-	order   []string // FIFO insertion order
-	counter uint64
+	clock Clock
+	mu    sync.RWMutex // RWMutex: Stats reads don't block each other
+	jobs  map[string]*entry
+	order []string // FIFO insertion order for lease priority
 }
 
 // New constructs an empty queue using the given clock.
@@ -59,15 +69,24 @@ func New(clock Clock) *JobQueue {
 	}
 }
 
+// newID returns a cryptographically random 16-byte hex string.
+// Sequential counters are predictable and unsafe across restarts.
+func newID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 // Enqueue stores a new job for processing and returns its unique ID.
 func (q *JobQueue) Enqueue(payload []byte) (string, error) {
+	// Defensive copy before acquiring the lock — caller's buffer stays independent.
+	p := make([]byte, len(payload))
+	copy(p, payload)
+	id := newID()
+
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	q.counter++
-	id := fmt.Sprintf("job-%d", q.counter)
-	p := make([]byte, len(payload))
-	copy(p, payload)
 	q.jobs[id] = &entry{id: id, payload: p, state: statePending}
 	q.order = append(q.order, id)
 	return id, nil
@@ -86,39 +105,45 @@ func (q *JobQueue) Lease(workerID string, leaseMS int64) (*LeasedJob, error) {
 		if e.state == stateCompleted {
 			continue
 		}
-		// Available if pending, or if leased but the lease has expired.
 		if e.state == statePending || (e.state == stateLeased && now >= e.leaseExpiresAt) {
 			e.state = stateLeased
 			e.leasedTo = workerID
 			e.leaseExpiresAt = now + leaseMS
+			e.attempts++
+
+			// Defensive copy so the worker cannot mutate queue-internal state.
+			payload := make([]byte, len(e.payload))
+			copy(payload, e.payload)
+
 			return &LeasedJob{
 				ID:             e.id,
-				Payload:        e.payload,
+				Payload:        payload,
 				LeaseExpiresAt: e.leaseExpiresAt,
+				Attempt:        e.attempts,
 			}, nil
 		}
 	}
 	return nil, nil
 }
 
-// Ack marks a job as completed. Returns an error if workerID is not the
-// current valid lease holder (wrong worker or expired lease).
+// Ack marks a job as completed. Returns a sentinel error if workerID is not
+// the current valid lease holder (wrong worker or expired lease).
 func (q *JobQueue) Ack(workerID, jobID string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	e, ok := q.jobs[jobID]
 	if !ok {
-		return errors.New("job not found")
+		return ErrJobNotFound
 	}
 	if e.state != stateLeased {
-		return errors.New("job is not currently leased")
+		return ErrNotLeased
 	}
 	if e.leasedTo != workerID {
-		return errors.New("stale ack: lease is held by a different worker")
+		return ErrWrongWorker
 	}
 	if q.clock.Now() >= e.leaseExpiresAt {
-		return errors.New("stale ack: lease has expired")
+		return ErrLeaseExpired
 	}
 	e.state = stateCompleted
 	e.leasedTo = ""
@@ -133,13 +158,13 @@ func (q *JobQueue) Fail(workerID, jobID string) error {
 
 	e, ok := q.jobs[jobID]
 	if !ok {
-		return errors.New("job not found")
+		return ErrJobNotFound
 	}
 	if e.state != stateLeased {
-		return errors.New("job is not currently leased")
+		return ErrNotLeased
 	}
 	if e.leasedTo != workerID {
-		return errors.New("fail from wrong worker")
+		return ErrWrongWorker
 	}
 	e.state = statePending
 	e.leasedTo = ""
@@ -147,10 +172,11 @@ func (q *JobQueue) Fail(workerID, jobID string) error {
 	return nil
 }
 
-// Stats returns counts of jobs by state. Used for harness progress checks.
+// Stats returns counts of jobs by state. Uses a read lock since no state
+// is modified — concurrent Stats calls do not block each other.
 func (q *JobQueue) Stats() Stats {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+	q.mu.RLock()
+	defer q.mu.RUnlock()
 
 	var s Stats
 	for _, e := range q.jobs {
