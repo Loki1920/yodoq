@@ -1,6 +1,10 @@
 package solution
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"sync"
+)
 
 // LeasedJob is what a worker receives when it successfully leases a job.
 type LeasedJob struct {
@@ -22,67 +26,142 @@ type Stats struct {
 	Completed int // acked successfully
 }
 
+type jobState int
+
+const (
+	statePending   jobState = iota
+	stateLeased
+	stateCompleted
+)
+
+type entry struct {
+	id             string
+	payload        []byte
+	state          jobState
+	leasedTo       string
+	leaseExpiresAt int64
+}
+
 // JobQueue is what you implement.
-//
-// LEVELS TO IMPLEMENT:
-//  1. Basic Enqueue / Lease / Ack / Fail with no failures
-//  2. Worker crash recovery — when a lease expires, the job must be re-leasable
-//  3. Bounded duplication under crash + dropped-ack rates of 0.1% to 50%
 type JobQueue struct {
-	clock Clock
-	// TODO: add your fields here
+	clock   Clock
+	mu      sync.Mutex
+	jobs    map[string]*entry
+	order   []string // FIFO insertion order
+	counter uint64
 }
 
 // New constructs an empty queue using the given clock.
 func New(clock Clock) *JobQueue {
-	return &JobQueue{clock: clock}
+	return &JobQueue{
+		clock: clock,
+		jobs:  make(map[string]*entry),
+	}
 }
 
 // Enqueue stores a new job for processing and returns its unique ID.
-//
-// TODO:
-//   - Generate an ID (any unique identifier)
-//   - Store the job in your "pending" state
-//   - Return the ID
 func (q *JobQueue) Enqueue(payload []byte) (string, error) {
-	return "", errors.New("not implemented")
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.counter++
+	id := fmt.Sprintf("job-%d", q.counter)
+	p := make([]byte, len(payload))
+	copy(p, payload)
+	q.jobs[id] = &entry{id: id, payload: p, state: statePending}
+	q.order = append(q.order, id)
+	return id, nil
 }
 
-// Lease atomically reserves the next available job for `workerID` for
-// `leaseMS` milliseconds. Returns (nil, nil) when no job is available.
-//
-// TODO:
-//   - Find an unleased pending job (or a job whose lease has expired)
-//   - Mark it as leased to workerID until clock.Now() + leaseMS
-//   - Return the leased job
+// Lease atomically reserves the next available job for workerID for leaseMS
+// milliseconds. Returns (nil, nil) when no job is available.
+// Jobs with expired leases are treated as pending and re-leased.
 func (q *JobQueue) Lease(workerID string, leaseMS int64) (*LeasedJob, error) {
-	return nil, errors.New("not implemented")
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	now := q.clock.Now()
+	for _, id := range q.order {
+		e := q.jobs[id]
+		if e.state == stateCompleted {
+			continue
+		}
+		// Available if pending, or if leased but the lease has expired.
+		if e.state == statePending || (e.state == stateLeased && now >= e.leaseExpiresAt) {
+			e.state = stateLeased
+			e.leasedTo = workerID
+			e.leaseExpiresAt = now + leaseMS
+			return &LeasedJob{
+				ID:             e.id,
+				Payload:        e.payload,
+				LeaseExpiresAt: e.leaseExpiresAt,
+			}, nil
+		}
+	}
+	return nil, nil
 }
 
-// Ack marks a job as completed. Should return an error if `workerID` is not
-// the current lease holder (e.g. the lease expired and was reassigned).
-//
-// TODO:
-//   - Validate workerID owns the current lease
-//   - Mark the job completed
-//   - Reject stale acks
+// Ack marks a job as completed. Returns an error if workerID is not the
+// current valid lease holder (wrong worker or expired lease).
 func (q *JobQueue) Ack(workerID, jobID string) error {
-	return errors.New("not implemented")
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	e, ok := q.jobs[jobID]
+	if !ok {
+		return errors.New("job not found")
+	}
+	if e.state != stateLeased {
+		return errors.New("job is not currently leased")
+	}
+	if e.leasedTo != workerID {
+		return errors.New("stale ack: lease is held by a different worker")
+	}
+	if q.clock.Now() >= e.leaseExpiresAt {
+		return errors.New("stale ack: lease has expired")
+	}
+	e.state = stateCompleted
+	e.leasedTo = ""
+	return nil
 }
 
-// Fail releases the lease without completing. The job must become
-// immediately re-leasable.
-//
-// TODO:
-//   - Validate workerID owns the lease
-//   - Return the job to the pending state
+// Fail releases the lease without completing. The job becomes immediately
+// re-leasable.
 func (q *JobQueue) Fail(workerID, jobID string) error {
-	return errors.New("not implemented")
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	e, ok := q.jobs[jobID]
+	if !ok {
+		return errors.New("job not found")
+	}
+	if e.state != stateLeased {
+		return errors.New("job is not currently leased")
+	}
+	if e.leasedTo != workerID {
+		return errors.New("fail from wrong worker")
+	}
+	e.state = statePending
+	e.leasedTo = ""
+	e.leaseExpiresAt = 0
+	return nil
 }
 
 // Stats returns counts of jobs by state. Used for harness progress checks.
-//
-// TODO: count pending / leased / completed jobs
 func (q *JobQueue) Stats() Stats {
-	return Stats{}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	var s Stats
+	for _, e := range q.jobs {
+		switch e.state {
+		case statePending:
+			s.Pending++
+		case stateLeased:
+			s.Leased++
+		case stateCompleted:
+			s.Completed++
+		}
+	}
+	return s
 }
